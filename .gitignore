@@ -1,0 +1,11 @@
+.build/
+build/
+.DS_Store
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+.env
+.env.*
+
+# Local settings capture; contains a personal app layout.
+/docs/assets/settings.png
