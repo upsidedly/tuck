@@ -13,7 +13,7 @@ Tuck keeps menu icons in **Pocket**, a compact bar beneath the macOS menu bar. K
 
 ## Arrange your icons
 
-Right-click Tuck’s caret and open **Settings…**. Allow Accessibility, then drag icons between three rows:
+Right-click Tuck’s caret and open **Settings…**. Allow Accessibility, then drag icons within or between three rows:
 
 | Row | Main menu bar | Pocket |
 | --- | --- | --- |
@@ -21,7 +21,11 @@ Right-click Tuck’s caret and open **Settings…**. Allow Accessibility, then d
 | Show in Bar | Hidden | Available |
 | Never Show | Hidden | Hidden |
 
-Your layout saves automatically. You can also right-click an icon or use its selection control to change its row. Press **⌘Z** to undo the last move.
+Newly detected menu icons go into **Show in Bar** automatically. The rows refresh as icons appear, including icons added by an already running app. Your saved visibility choices and order are preserved.
+
+Your layout saves automatically. The fixed caret in **Always Show** marks Tuck’s position. Drop icons before or after it. Select an icon for left/right move buttons, or right-click it for the same controls. Press **⌘Z** to undo the last move, including its order.
+
+Native icon moves use the existing Accessibility permission. Tuck does not ask you to choose a system settings file.
 
 Supported movable system icons have separate rules. Clock and Control Center stay available. Third-party apps with several menu items share one rule.
 
@@ -29,11 +33,19 @@ Supported movable system icons have separate rules. Clock and Control Center sta
 
 Click Tuck’s caret or press **⌃⌥B** to open or close Pocket. The caret points left when closed and down when open. Select a Pocket icon to open its real menu. Press **Esc** or click outside Pocket to close it.
 
+Pocket shows running apps. Quitting an app removes its icon from Pocket while preserving its row and order in Settings for its next launch.
+
 ## Settings
 
 Right-click the caret for Settings and Quit. Settings opens in a standard Mac window. Choose **Black** or **Liquid Glass** for Pocket. The close timer and **Open at login** start off. Quitting restores your native icons and keeps the saved layout.
 
 Screen Recording is optional. Allow it to show actual menu-bar images in Pocket and Settings. Without it, Tuck uses app artwork. Images are saved snapshots; use **Refresh** when an indicator changes. Capture can briefly reveal a Show-in-Bar item. Never-Show items stay hidden.
+
+## Download
+
+Download the latest [release](https://github.com/upsidedly/tuck/releases/latest), open the `.dmg`, and drag **Tuck** into **Applications**. These builds are for Apple silicon Macs. Quit an older Tuck before replacing it.
+
+The app is locally signed and is not notarized. macOS may require first-launch approval in **System Settings → Privacy & Security**.
 
 ## Install from source
 
@@ -48,7 +60,7 @@ open /Applications/Tuck.app
 
 Allow Accessibility in **System Settings → Privacy & Security**. Screen Recording is needed only for menu-bar images.
 
-The script builds and signs the app locally and backs up an earlier installation. Quit Tuck before updating it. There is no notarized download yet. After a rebuild, macOS may require you to remove and add Tuck’s permission entries again.
+The script builds and signs the app locally and backs up an earlier installation. Quit Tuck before updating it. After a rebuild, macOS may require you to remove and add Tuck’s permission entries again.
 
 ## Compatibility and privacy
 
