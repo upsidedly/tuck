@@ -9,11 +9,16 @@ import UniformTypeIdentifiers
 @MainActor @Observable
 final class TuckModel {
     static let host = "dev.matthew.tuck"
-    private(set) var apps: [TuckedApp]
+    private(set) var layout: MenuLayout
+    private(set) var apps: [TuckedApp] {
+        get { layout.apps }
+        set { layout.apps = newValue }
+    }
     private(set) var delay: AutoHideDelay
     private(set) var pocketStyle: PocketStyle
     private(set) var isRevealed = false
     private(set) var isApplying = false
+    private(set) var isReordering = false
     private(set) var shortcutAvailable = false
     private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
     private(set) var hasAccessibility = AXIsProcessTrusted()
@@ -25,10 +30,13 @@ final class TuckModel {
     private(set) var menuIcons: [MenuIcon] = []
     private(set) var isReadingMenu = false
     private(set) var menuReadFailed = false
-    private(set) var previousLayout: [TuckedApp]?
+    private var runningBundleIDs: Set<String> = []
+    private(set) var previousLayout: MenuLayout?
+    private var observedVisibleOrder: [String] = []
     private var visibilityError: String?
     private var actionError: String?
     private var iconCaptureError: String?
+    private var orderingError: String?
     var settingsOpen = false
     var onChange: (() -> Void)?
     var onRequestSettings: (() -> Void)?
@@ -38,14 +46,22 @@ final class TuckModel {
     @ObservationIgnored private let catalog = MenuCatalog()
     @ObservationIgnored private let glyphStore = MenuGlyphStore()
     @ObservationIgnored private let menuTracker = NativeMenuTracker()
+    @ObservationIgnored private let menuDrag = MenuBarDragController()
     @ObservationIgnored private let hotKey = HotKey()
+    @ObservationIgnored private let clockBridge = ClockActivationBridge()
+    @ObservationIgnored private var clockHandoff = false
     @ObservationIgnored private var timer: Task<Void, Never>?
     @ObservationIgnored private var deadline: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var discoveryTask: Task<Void, Never>?
     @ObservationIgnored private var activationTask: Task<Void, Never>?
     @ObservationIgnored private var glyphTask: Task<Void, Never>?
     @ObservationIgnored private var cacheTask: Task<Void, Never>?
+    @ObservationIgnored private var orderingTask: Task<Void, Never>?
+    @ObservationIgnored private var orderGeneration = 0
+    @ObservationIgnored private var orderRequested = false
     @ObservationIgnored private var glyphGeneration = 0
+    @ObservationIgnored private var glyphRefreshRequested = false
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var refreshGeneration = 0
     @ObservationIgnored private var actionGeneration = 0
@@ -53,12 +69,19 @@ final class TuckModel {
     @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
     @ObservationIgnored private let defaults: UserDefaults
 
-    var pocketApps: [TuckedApp] { VisibilityPolicy.pocketApps(apps, host: Self.host) }
+    var pocketApps: [TuckedApp] { VisibilityPolicy.pocketApps(apps, host: Self.host, running: runningBundleIDs) }
     var hiddenCount: Int { pocketApps.count }
     var managedCount: Int { apps.filter { $0.visibility != .show }.count }
     var isSupported: Bool { session.isSupported }
-    var errorMessage: String? { visibilityError ?? actionError ?? iconCaptureError }
+    var errorMessage: String? { visibilityError ?? actionError ?? orderingError ?? iconCaptureError }
     var layoutApps: [TuckedApp] { VisibilityPolicy.normalized(apps + detectedApps, host: Self.host) }
+    private var editableLayout: MenuLayout {
+        let merged = MenuLayout(apps: layoutApps,
+            alwaysShowOrder: layout.alwaysShowOrder.isEmpty ? observedVisibleOrder : layout.alwaysShowOrder,
+            host: Self.host)
+        return MenuLayout(apps: merged.apps, alwaysShowOrder: merged.row(.show, host: Self.host), host: Self.host)
+    }
+    func layoutIDs(for rule: IconVisibility) -> [String] { editableLayout.row(rule, host: Self.host) }
     var needsMenuImages: Bool { pocketApps.contains { app in !glyphRecords.contains { $0.owner == app.id && glyphImages[$0.key] != nil } } }
     var pocketItems: [PocketItem] {
         pocketApps.flatMap { app -> [PocketItem] in
@@ -89,13 +112,48 @@ final class TuckModel {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        let data = defaults.data(forKey: "apps")
-        apps = VisibilityPolicy.normalized(data.flatMap { try? JSONDecoder().decode([TuckedApp].self, from: $0) } ?? [], host: Self.host)
+        let decoded = defaults.data(forKey: "layout").flatMap { try? JSONDecoder().decode(MenuLayout.self, from: $0) }
+        let legacy = defaults.data(forKey: "apps").flatMap { try? JSONDecoder().decode([TuckedApp].self, from: $0) } ?? []
+        layout = MenuLayout(apps: decoded?.apps ?? legacy, alwaysShowOrder: decoded?.alwaysShowOrder ?? [], host: Self.host)
         delay = AutoHideDelay(rawValue: defaults.integer(forKey: "autoHideDelay")) ?? .off
         pocketStyle = defaults.string(forKey: "pocketStyle").flatMap(PocketStyle.init(rawValue:)) ?? .black
+        defaults.removeObject(forKey: "menuPositionBookmark")
     }
 
     func start() {
+        clockBridge.shouldBridge = { [weak self] in self?.hasAccessibility == true && (self?.managedCount ?? 0) > 0 }
+        clockBridge.clockFrame = { [weak self] in self?.menuIcons.first(where: { $0.identifier == "com.apple.menuextra.clock" })?.frame }
+        clockBridge.pressClock = { [weak self] in
+            guard let self, let clock = self.menuIcons.first(where: { $0.identifier == "com.apple.menuextra.clock" }) else { return false }
+            return await self.catalog.press(id: clock.id) == AXError.success.rawValue
+        }
+        clockBridge.prepareHandoff = { [weak self] in
+            guard let self else { return }
+            let wasTemporary = self.temporaryApp != nil
+            self.cancelGlyphCapture(); self.cancelNativeMenu(); self.cancelMenuOrder()
+            self.hide()
+            self.actionError = nil
+            if wasTemporary { self.applyNativeVisibility() }
+        }
+        clockBridge.releaseRestriction = { [weak self] in
+            guard let self else { return }
+            self.clockHandoff = true
+            self.applyNativeVisibility()
+        }
+        clockBridge.restoreRestriction = { [weak self] in
+            guard let self else { return }
+            self.clockHandoff = false
+            self.applyNativeVisibility()
+        }
+        clockBridge.waitForRestoration = { [weak self] in
+            for _ in 0..<100 {
+                guard let self, !Task.isCancelled else { return false }
+                if !self.isApplying { return self.visibilityError == nil }
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return false }
+            }
+            return false
+        }
+        clockBridge.reportError = { [weak self] error in self?.actionError = error; self?.onChange?() }
         hotKey.onPress = { [weak self] in self?.toggle() }
         shortcutAvailable = hotKey.register()
         let center = NSWorkspace.shared.notificationCenter
@@ -104,8 +162,21 @@ final class TuckModel {
                 MainActor.assumeIsolated { self?.runningAppsChanged() }
             })
         }
-        if managedCount > 0 { applyNativeVisibility() }
+        orderRequested = !layout.alwaysShowOrder.isEmpty
+        if managedCount > 0 || orderRequested { applyNativeVisibility() }
         refreshMenuApps()
+        discoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let interval = self?.settingsOpen == true || self?.isRevealed == true ? 2 : 5
+                do { try await Task.sleep(for: .seconds(interval)) } catch { return }
+                guard let self else { return }
+                // A read must not replace the AX action cache during a native
+                // menu activation, capture, reorder, or an unfinished read.
+                if !self.isReadingMenu {
+                    self.refreshMenuApps()
+                }
+            }
+        }
         cacheTask = Task { [weak self] in
             guard let self else { return }
             let cached = await self.glyphStore.load()
@@ -117,9 +188,13 @@ final class TuckModel {
     }
 
     func stop() {
+        clockBridge.stop()
+        clockHandoff = false
         generation += 1; actionGeneration += 1; refreshGeneration += 1; glyphGeneration += 1
         deadline?.cancel(); timer?.cancel(); refreshTask?.cancel(); activationTask?.cancel()
+        discoveryTask?.cancel(); discoveryTask = nil
         glyphTask?.cancel(); cacheTask?.cancel()
+        cancelMenuOrder()
         menuTracker.stop()
         session.showAll()
         hotKey.unregister()
@@ -129,7 +204,10 @@ final class TuckModel {
 
     func toggle() { isRevealed ? hide() : show() }
 
+    func openNotificationCenter() { clockBridge.activate() }
+
     func show() {
+        guard !isReordering else { return }
         guard hiddenCount > 0, hasAccessibility else { onRequestSettings?(); return }
         isRevealed = true
         onChange?()
@@ -145,6 +223,7 @@ final class TuckModel {
 
     func retry() {
         actionError = nil
+        orderRequested = !layout.alwaysShowOrder.isEmpty
         applyNativeVisibility()
         refreshMenuApps()
         refreshMenuGlyphs(force: true)
@@ -157,10 +236,17 @@ final class TuckModel {
         generation += 1
         let revision = generation
         visibilityError = nil
+        if clockHandoff {
+            session.showAll()
+            isApplying = false
+            onChange?()
+            return
+        }
         if VisibilityPolicy.suppressedItems(apps: apps, host: Self.host, temporarilyVisible: temporaryApp).isEmpty {
             session.showAll()
             isApplying = false
             onChange?()
+            applyMenuOrderIfNeeded()
             return
         }
         let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
@@ -175,6 +261,7 @@ final class TuckModel {
                 self.isApplying = false
                 self.visibilityError = error?.localizedDescription
                 self.onChange?()
+                if error == nil { self.applyMenuOrderIfNeeded() }
             }
         }
         deadline = Task { [weak self] in
@@ -295,16 +382,32 @@ final class TuckModel {
 
     func move(_ app: TuckedApp, to rule: IconVisibility, before target: String? = nil) {
         guard VisibilityPolicy.canHide(app.id, host: Self.host) else { return }
-        let next = VisibilityPolicy.moving(app, to: rule, before: target, apps: apps, host: Self.host)
-        guard next != apps else { return }
-        previousLayout = apps
-        apps = next
+        let current = editableLayout
+        let next = current.moving(id: app.id, to: rule, before: target, host: Self.host)
+        guard next != current else { return }
+        previousLayout = current
+        layout = next
+        layoutChanged()
+    }
+
+    func canShift(id: String, by offset: Int) -> Bool {
+        guard offset == -1 || offset == 1, let app = layoutApps.first(where: { $0.id == id }),
+              let index = layoutIDs(for: app.visibility).firstIndex(of: id) else { return false }
+        return layoutIDs(for: app.visibility).indices.contains(index + offset)
+    }
+
+    func shift(id: String, by offset: Int) {
+        let current = editableLayout
+        let next = current.shifting(id: id, by: offset, host: Self.host)
+        guard next != current else { return }
+        previousLayout = current
+        layout = next
         layoutChanged()
     }
 
     func undoLayoutChange() {
         guard let previousLayout else { return }
-        apps = previousLayout
+        layout = previousLayout
         self.previousLayout = nil
         layoutChanged()
     }
@@ -317,12 +420,16 @@ final class TuckModel {
     }
 
     func remove(id: String) {
-        previousLayout = apps
-        apps.removeAll { $0.id == id }
+        guard VisibilityPolicy.canHide(id, host: Self.host) else { return }
+        previousLayout = layout
+        layout = layout.removing(id: id, host: Self.host)
         layoutChanged()
     }
 
     private func layoutChanged() {
+        cancelMenuOrder()
+        orderingError = nil
+        orderRequested = !layout.alwaysShowOrder.isEmpty
         cancelGlyphCapture()
         cancelNativeMenu()
         if hiddenCount == 0 { isRevealed = false }
@@ -330,6 +437,62 @@ final class TuckModel {
         applyNativeVisibility()
         scheduleAutoHide()
         if hasScreenRecording { refreshMenuGlyphs() }
+    }
+
+    private func cancelMenuOrder() {
+        orderGeneration += 1
+        orderingTask?.cancel(); orderingTask = nil
+        menuDrag.cancel()
+        isReordering = false
+    }
+
+    private func applyMenuOrderIfNeeded() {
+        guard orderRequested, !isApplying, !isCapturingIcons, temporaryApp == nil,
+              !clockBridge.isActive, !clockBridge.panelVisible,
+              hasAccessibility, let screen = NSScreen.main else { return }
+        cancelMenuOrder()
+        orderRequested = false
+        isReordering = true; orderingError = nil
+        let revision = orderGeneration
+        let order = layoutIDs(for: .show)
+        let running = NSWorkspace.shared.runningApplications
+        let agent = running.first(where: { $0.bundleIdentifier == "com.apple.MenuBarAgent" })?.processIdentifier
+        let bundles = Set(apps.filter { $0.visibility == .show }.flatMap { [$0.id, $0.ownerBundleID ?? $0.id] }).union([Self.host])
+        let clients = running.filter { $0.bundleIdentifier.map { bundles.contains($0) } == true }.map(\.processIdentifier)
+        let owners = Dictionary(uniqueKeysWithValues: running.compactMap { app in app.bundleIdentifier.map { (app.processIdentifier, $0) } })
+        let bar = CGRect(x: screen.frame.minX,
+            y: NSScreen.screens.first.map { $0.frame.maxY - screen.frame.maxY } ?? 0,
+            width: screen.frame.width, height: max(NSStatusBar.system.thickness, screen.safeAreaInsets.top))
+        onChange?()
+        orderingTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(350))
+                let confirmed = try await self.catalog.arrange(order: order, host: Self.host, agentPID: agent,
+                    clientPIDs: clients, owners: owners, bar: bar, drag: self.menuDrag)
+                guard !Task.isCancelled, self.orderGeneration == revision else { return }
+                self.observedVisibleOrder = confirmed
+            } catch is CancellationError { return }
+            catch {
+                guard !Task.isCancelled, self.orderGeneration == revision else { return }
+                switch error {
+                case MenuOrderError.unavailable(let id):
+                    let name = self.layoutApps.first(where: { $0.id == id })?.name ?? "Tuck"
+                    self.orderingError = "Couldn’t read \(name)’s menu position. Refresh and try again."
+                case MenuOrderError.didNotMove:
+                    self.orderingError = "The menu bar did not accept the new order. Try again."
+                case MenuOrderError.inputBusy:
+                    self.orderingError = "Finish dragging, then try again."
+                case MenuOrderError.accessibility:
+                    self.orderingError = "Allow Accessibility to arrange menu icons."
+                default: self.orderingError = error.localizedDescription
+                }
+            }
+            guard self.orderGeneration == revision else { return }
+            self.isReordering = false; self.orderingTask = nil
+            self.onChange?()
+            if self.hasScreenRecording { self.refreshMenuGlyphs() }
+        }
     }
 
     func add(url: URL) {
@@ -341,7 +504,7 @@ final class TuckModel {
         let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
             ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
             ?? url.deletingPathExtension().lastPathComponent
-        previousLayout = apps
+        previousLayout = layout
         apps.removeAll { $0.id == id }
         apps.append(TuckedApp(id: id, name: name, path: url.path, visibility: .show))
         layoutChanged()
@@ -406,13 +569,15 @@ final class TuckModel {
     }
 
     func refreshMenuGlyphs(force: Bool = false) {
-        guard hasAccessibility, hasScreenRecording, !isCapturingIcons, temporaryApp == nil else { return }
+        if force { glyphRefreshRequested = true }
+        guard hasAccessibility, hasScreenRecording, !isReadingMenu, !isCapturingIcons, !isReordering, !orderRequested, temporaryApp == nil, !clockBridge.isActive else { return }
         let visibleItems = layoutApps.filter { $0.visibility == .show && !entries(for: $0).isEmpty }
         let candidates = VisibilityPolicy.normalized(pocketApps + visibleItems, host: Self.host)
         let pending = candidates.filter { app in
-            force || !glyphRecords.contains { $0.owner == app.id && glyphImages[$0.key] != nil }
+            glyphRefreshRequested || !glyphRecords.contains { $0.owner == app.id && glyphImages[$0.key] != nil }
         }
         guard !pending.isEmpty, let screen = NSScreen.main else { return }
+        glyphRefreshRequested = false
         let scale = screen.backingScaleFactor
         let screenRect = CGRect(x: screen.frame.minX, y: NSScreen.screens.first.map { $0.frame.maxY - screen.frame.maxY } ?? 0,
                                 width: screen.frame.width, height: screen.frame.height)
@@ -465,24 +630,32 @@ final class TuckModel {
     }
 
     func refreshMenuApps() {
-        refreshGeneration += 1
-        let revision = refreshGeneration
-        refreshTask?.cancel()
+        runningBundleIDs = Set(NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }.compactMap(\.bundleIdentifier))
+        let wasTrusted = hasAccessibility
         hasAccessibility = AXIsProcessTrusted()
         hasScreenRecording = CGPreflightScreenCaptureAccess()
+        clockBridge.synchronize(hasAccessibility: hasAccessibility)
         if isCapturingIcons && (!hasAccessibility || !hasScreenRecording) {
             cancelGlyphCapture()
             applyNativeVisibility()
         }
         guard hasAccessibility else {
+            refreshGeneration += 1
+            refreshTask?.cancel(); refreshTask = nil
             if temporaryApp != nil { finishNativeMenu() }
             isReadingMenu = false
             menuReadFailed = false
             menuIcons = []
             if isRevealed { hide() }
+            if wasTrusted { applyNativeVisibility() }
             onChange?()
             return
         }
+        if !wasTrusted { applyNativeVisibility() }
+        guard !isApplying, !isReordering, !isCapturingIcons, temporaryApp == nil, !clockBridge.isActive else { return }
+        refreshGeneration += 1
+        let revision = refreshGeneration
+        refreshTask?.cancel()
         isReadingMenu = true
         menuReadFailed = false
         refreshTask = Task { [weak self] in
@@ -495,6 +668,14 @@ final class TuckModel {
             self.menuIcons = icons + self.menuIcons.filter { icon in
                 livePIDs.contains(icon.pid) && !freshIDs.contains(icon.id) && savedHidden.contains { self.matches(icon, app: $0) }
             }
+            let positioned = icons.filter { icon in
+                guard let frame = icon.frame else { return false }
+                return frame.width > 0 && frame.height > 0 && frame.minX >= 0
+            }.sorted { ($0.frame?.minX ?? 0) < ($1.frame?.minX ?? 0) }
+            let visibleIDs = positioned.map { icon in
+                icon.identifier == "tuck-menu-bar" ? Self.host : icon.systemItem?.id ?? icon.ownerBundleID
+            }
+            if visibleIDs.contains(Self.host) { self.observedVisibleOrder = visibleIDs }
             let owners = Set(icons.map(\.pid))
             let systemEntries = icons.compactMap { icon -> TuckedApp? in
                 guard let system = icon.systemItem else { return nil }
@@ -507,16 +688,16 @@ final class TuckModel {
             }
             self.detectedApps = VisibilityPolicy.normalized(systemEntries + appEntries, host: Self.host)
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            var updated = self.apps
-            for index in updated.indices where updated[index].systemItem != nil {
-                if let fresh = systemEntries.first(where: { $0.id == updated[index].id }) {
-                    updated[index].ownerBundleID = fresh.ownerBundleID
-                }
+            let updated = self.layout.discovering(self.detectedApps, host: Self.host)
+            if updated != self.layout {
+                self.layout = updated
+                self.persist()
+                self.applyNativeVisibility()
             }
-            if updated != self.apps { self.apps = updated; self.persist(); self.applyNativeVisibility() }
             self.isReadingMenu = false
             self.menuReadFailed = self.detectedApps.isEmpty
             self.onChange?()
+            self.applyMenuOrderIfNeeded()
             if self.hasScreenRecording { self.refreshMenuGlyphs() }
         }
         onChange?()
@@ -566,13 +747,19 @@ final class TuckModel {
     }
 
     private func runningAppsChanged() {
+        runningBundleIDs = Set(NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }.compactMap(\.bundleIdentifier))
         if let temporaryApp, let app = apps.first(where: { $0.id == temporaryApp }), !isRunning(app) { cancelNativeMenu() }
-        if managedCount > 0 { applyNativeVisibility() }
+        orderRequested = !layout.alwaysShowOrder.isEmpty
+        if managedCount > 0 || orderRequested { applyNativeVisibility() }
         refreshMenuApps()
     }
 
     private func persist() {
-        do { defaults.set(try JSONEncoder().encode(apps), forKey: "apps") }
+        do {
+            defaults.set(try JSONEncoder().encode(layout), forKey: "layout")
+            // Keep the rule list readable by an earlier local build.
+            defaults.set(try JSONEncoder().encode(apps), forKey: "apps")
+        }
         catch { actionError = "Could not save your app list. \(error.localizedDescription)" }
     }
 }

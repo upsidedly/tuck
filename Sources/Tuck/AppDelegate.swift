@@ -37,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         model.start()
         updateStatusItem()
         installApplicationMenu()
-        if !model.hasAccessibility { showSettings() }
+        if !model.hasAccessibility || CommandLine.arguments.contains("--settings") { showSettings() }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -147,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func toggleIcons() { model.toggle() }
+    @objc private func openNotificationCenter() { model.openNotificationCenter() }
     @objc private func closeSettings() { settings?.performClose(nil) }
     @objc private func undoMove() { model.undoLayoutChange() }
 
@@ -158,6 +159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toggle.keyEquivalentModifierMask = [.control, .option]
         toggle.target = self
         app.addItem(toggle)
+        let notifications = NSMenuItem(title: "Notification Centre", action: #selector(openNotificationCenter), keyEquivalent: "2")
+        notifications.target = self
+        app.addItem(notifications)
         let preferences = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         preferences.target = self
         app.addItem(preferences)

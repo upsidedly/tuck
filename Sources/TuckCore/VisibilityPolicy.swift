@@ -94,6 +94,11 @@ public enum VisibilityPolicy {
         normalized(apps, host: host).filter { $0.visibility == .hide }
     }
 
+    /// Saved rules survive quitting an app; Pocket only shows live owners.
+    public static func pocketApps(_ apps: [TuckedApp], host: String, running: Set<String>) -> [TuckedApp] {
+        pocketApps(apps, host: host).filter { running.contains($0.ownerBundleID ?? $0.id) }
+    }
+
     /// Move one app between groups, preserving the order chosen in the editor.
     public static func moving(_ app: TuckedApp, to rule: IconVisibility, before target: String? = nil,
                               apps: [TuckedApp], host: String) -> [TuckedApp] {

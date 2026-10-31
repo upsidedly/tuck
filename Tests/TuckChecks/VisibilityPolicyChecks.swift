@@ -54,6 +54,23 @@ func earlierHidePreferencesMigrate() throws {
     precondition(apps.map(\.visibility) == [.hide, .show])
 }
 
+func pocketTracksRunningOwnersWithoutDiscardingSavedRules() throws {
+    let apps = [TuckedApp(id: "dev.closed", name: "Closed", path: ""),
+                TuckedApp(id: "dev.live", name: "Live", path: ""),
+                TuckedApp(id: SystemMenuItem.displays.id, name: "Displays", path: "", ownerBundleID: "com.apple.MenuBarAgent"),
+                TuckedApp(id: "dev.never", name: "Never", path: "", visibility: .neverShow),
+                TuckedApp(id: "dev.always", name: "Always", path: "", visibility: .show)]
+    let saved = try JSONEncoder().encode(apps)
+    let running: Set<String> = ["dev.live", "com.apple.MenuBarAgent", "dev.never", "dev.always"]
+    precondition(VisibilityPolicy.pocketApps(apps, host: "dev.tuck", running: running).map(\.id)
+        == ["dev.live", SystemMenuItem.displays.id])
+    precondition(VisibilityPolicy.pocketApps(apps, host: "dev.tuck", running: []).isEmpty)
+    precondition(VisibilityPolicy.pocketApps(apps, host: "dev.tuck", running: running.union(["dev.closed"])).map(\.id)
+        == ["dev.closed", "dev.live", SystemMenuItem.displays.id])
+    let restored = try JSONDecoder().decode([TuckedApp].self, from: saved)
+    precondition(restored == apps)
+}
+
 func draggingChangesOnlyTheChosenAppsGroup() {
     let one = TuckedApp(id: "dev.one", name: "One", path: "one", visibility: .show)
     let two = TuckedApp(id: "dev.two", name: "Two", path: "two", visibility: .neverShow)
@@ -188,6 +205,7 @@ func iconRastersKeepGlyphsWithoutBackgroundTiles() {
         disabledSelectionAndNewlyLaunchedAppsRemainVisible()
         try savedSelectionsRoundTripWithoutDuplicates()
         try earlierHidePreferencesMigrate()
+        try pocketTracksRunningOwnersWithoutDiscardingSavedRules()
         draggingChangesOnlyTheChosenAppsGroup()
         try movingAnIconBeforeAnotherPreservesItsSavedOrder()
         repeatedMovesNeverDuplicateAnIcon()
@@ -211,6 +229,9 @@ func iconRastersKeepGlyphsWithoutBackgroundTiles() {
         try systemIconsHaveIndependentRulesAndProtectedControls()
         systemHelperRulesDoNotHideOtherAppleControls()
         systemDiscoveryUsesNativeIdentifiersAndKnownHelpers()
-        print("PASS: 38 visibility, system-item, Pocket, persistence and icon-image checks")
+        try menuLayoutsKeepAnImmovableCaret()
+        try discoveryTucksNewIconsAndPreservesSavedChoices()
+        notificationCenterShortcutsRespectSystemOverrides()
+        print("PASS: visibility, discovery, row order, fixed caret, system-item, Pocket, persistence, shortcut and icon-image checks")
     }
 }
